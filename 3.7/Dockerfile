@@ -39,6 +39,7 @@ RUN true \
         php \
         php-intl \
         php-pgsql \
+        php-cgi \
         apache2 \
         libapache2-mod-php \
         # Python 3.
@@ -47,61 +48,36 @@ RUN true \
         python3-tidylib \
         python3-psycopg2 \
         python3-setuptools \
+        python3-dotenv \
+        python3-psutil \
+        python3-jinja2 \
+        python3-icu git \
+        python3-argparse-manpage \
         # Misc.
         git \
         curl \
         sudo
 
+
 # Configure postgres.
 RUN true \
-    && echo "host all all 0.0.0.0/0 trust" >> /etc/postgresql/12/main/pg_hba.conf \
+    && echo "host all all 0.0.0.0/0 md5" >> /etc/postgresql/12/main/pg_hba.conf \
     && echo "listen_addresses='*'" >> /etc/postgresql/12/main/postgresql.conf
 
 # Osmium install to run continuous updates.
 RUN pip3 install osmium
 
 # Nominatim install.
-ENV NOMINATIM_VERSION v3.5.2
+ENV NOMINATIM_VERSION 3.7.2
 
 RUN true \
-    && git clone \
-        --config advice.detachedHead=false \
-        --single-branch \
-        --branch $NOMINATIM_VERSION \
-        --depth 1 \
-        --recursive \
-        https://github.com/openstreetmap/Nominatim \
-        src \
-    && cd src \
+    && curl https://nominatim.org/release/Nominatim-$NOMINATIM_VERSION.tar.bz2 -o nominatim.tar.bz2 \
+    && tar xf nominatim.tar.bz2 \
     && mkdir build \
     && cd build \
-    && cmake .. \
-    && make -j`nproc` \
-    && chmod o=rwx .
-
-# Apache configure.
-COPY local.php /app/src/build/settings/local.php
-COPY nominatim.conf /etc/apache2/sites-enabled/000-default.conf
-
-# Load initial data.
-ARG with_postcodes_gb
-ARG with_postcodes_us
-
-RUN if [ "$with_postcodes_gb" = "" ]; then \
-    echo "Skipping optional GB postcode file"; \
-    else \
-    echo "Downloading optional GB postcode file"; \
-    curl https://www.nominatim.org/data/gb_postcode_data.sql.gz > /app/src/data/gb_postcode_data.sql.gz; \
-    fi;
-
-RUN if [ "$with_postcodes_us" = "" ]; then \
-    echo "Skipping optional US postcode file"; \
-    else \
-    echo "Downloading optional US postcode file"; \
-    curl https://www.nominatim.org/data/us_postcode_data.sql.gz > /app/src/data/us_postcode_data.sql.gz; \
-    fi;
-
-RUN curl https://www.nominatim.org/data/country_grid.sql.gz > /app/src/data/country_osm_grid.sql.gz
+    && cmake ../Nominatim-$NOMINATIM_VERSION \
+    && make \
+    && make install
 
 RUN true \
     # Remove development and unused packages.
@@ -126,8 +102,20 @@ RUN true \
         /root/.cache \
         /app/src/.git \
         /var/lib/apt/lists/* \
-        /var/lib/postgresql/12/main/*
+    # Remove nominatim source and build directories
+    && rm /app/*.tar.bz2 \
+    && rm -rf /app/build \
+    && rm -rf /app/Nominatim-$NOMINATIM_VERSION
 
+# Apache configuration
+COPY conf.d/apache.conf /etc/apache2/sites-enabled/000-default.conf
+CMD a2enconf nominatim
+
+# Postgres config overrides to improve import performance (but reduce crash recovery safety)
+COPY conf.d/postgres-import.conf /etc/postgresql/12/main/conf.d/
+COPY conf.d/postgres-tuning.conf /etc/postgresql/12/main/conf.d/
+
+COPY config.sh /app/config.sh
 COPY init.sh /app/init.sh
 COPY start.sh /app/start.sh
 COPY startapache.sh /app/startapache.sh
@@ -138,7 +126,19 @@ FROM scratch
 
 COPY --from=build / /
 
+# Please override this
+ENV NOMINATIM_PASSWORD qaIACxO6wMR3
+# how many threads should be use for importing
+ENV THREADS=16
+
+ENV PROJECT_DIR /nominatim
+CMD mkdir ${PROJECT_DIR}
+
 WORKDIR /app
 
 EXPOSE 5432
 EXPOSE 8080
+
+COPY conf.d/env $PROJECT_DIR/.env
+
+CMD /app/start.sh
